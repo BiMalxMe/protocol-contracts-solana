@@ -1,0 +1,26 @@
+# Anchor build artifacts
+target/
+**/target/
+.DS_Store
+
+# Anchor localnet/test validator state
+test-ledger/
+.localnet/
+*.log
+
+# Anchor IDL output
+**/idl/
+*.json
+
+# Anchor deploy artifacts
+deploy/
+*.so
+*.dSYM
+
+# Anchor cache
+.anchor/
+
+# Misc
+node_modules/
+coverage/
+# End Generation Here

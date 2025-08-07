@@ -6,7 +6,9 @@ solana_version = "2.1.0"
 members = [
   "programs/gateway",
   "programs/examples/connected",
-  "programs/examples/connectedSPL"
+  "programs/examples/connectedSPL",
+      "programs/universal_nft", #adding new line
+
 ]
 
 [features]

@@ -2,8 +2,10 @@
 members = [
     "programs/gateway",
     "programs/examples/connected",
-    "programs/examples/connectedSPL"
-]
+    "programs/examples/connectedSPL",
+        "programs/universal-nftt"   # <-- add this line
+
+, "programs/universal_nft"]
 resolver = "2"
 
 [profile.release]

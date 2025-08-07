@@ -1,0 +1,23 @@
+[package]
+name = "universal-nft"
+version = "0.1.0"
+description = "Universal NFT program for cross-chain transfers"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "universal_nft"
+
+[features]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+cpi = ["no-entrypoint"]
+default = []
+
+[dependencies]
+anchor-lang = "0.30.1"
+anchor-spl = "0.30.1"
+solana-program = "1.18.4"
+mpl-token-metadata = "4.1.2"
+gateway = { path = "../gateway" }
