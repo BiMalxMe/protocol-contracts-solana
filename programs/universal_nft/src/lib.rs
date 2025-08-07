@@ -1,29 +1,31 @@
 use anchor_lang::prelude::*;
+use anchor_lang::solana_program::compute_budget::ComputeBudgetInstruction;
 use anchor_spl::{
     associated_token::AssociatedToken,
     metadata::{create_metadata_accounts_v3, CreateMetadataAccountsV3, Metadata},
-    token::{mint_to, Mint, MintTo, Token, TokenAccount},
+    token::{mint_to, transfer, Mint, MintTo, Token, TokenAccount, Transfer},
 };
-use gateway::{Gateway, OutboundMessage};
 use mpl_token_metadata::{
-    pda::{find_master_edition_account, find_metadata_account},
-    state::{DataV2, TokenMetadataAccount},
+    pda::{find_metadata_account},
+    state::{DataV2, Metadata as TokenMetadata},
 };
 
-declare_id!("UnivNFT1111111111111111111111111111111111");
+declare_id!("7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsUgit");
 
 #[program]
 pub mod universal_nft {
     use super::*;
 
     /// Initialize the universal NFT program
-    pub fn initialize(ctx: Context<Initialize>) -> Result<()> {
+    pub fn initialize(ctx: Context<Initialize>, gateway: Pubkey) -> Result<()> {
         let nft_program = &mut ctx.accounts.nft_program;
         nft_program.authority = ctx.accounts.authority.key();
         nft_program.total_supply = 0;
-        nft_program.gateway = ctx.accounts.gateway.key();
+        nft_program.gateway = gateway;
+        nft_program.nonce = 0;
+        nft_program.bump = ctx.bumps.nft_program;
         
-        msg!("Universal NFT program initialized");
+        msg!("Universal NFT program initialized with gateway: {}", gateway);
         Ok(())
     }
 
@@ -33,7 +35,13 @@ pub mod universal_nft {
         name: String,
         symbol: String,
         uri: String,
+        recipient: Pubkey,
     ) -> Result<()> {
+        // Validate inputs
+        require!(name.len() <= 32, NftError::InvalidMetadata);
+        require!(symbol.len() <= 10, NftError::InvalidMetadata);
+        require!(uri.len() <= 200, NftError::InvalidMetadata);
+
         // Mint the token
         mint_to(
             CpiContext::new(
@@ -41,9 +49,12 @@ pub mod universal_nft {
                 MintTo {
                     mint: ctx.accounts.mint.to_account_info(),
                     to: ctx.accounts.token_account.to_account_info(),
-                    authority: ctx.accounts.mint_authority.to_account_info(),
+                    authority: ctx.accounts.nft_program.to_account_info(),
                 },
-            ),
+            ).with_signer(&[&[
+                b"nft-program",
+                &[ctx.accounts.nft_program.bump]
+            ]]),
             1, // NFTs have supply of 1
         )?;
 
@@ -64,13 +75,16 @@ pub mod universal_nft {
                 CreateMetadataAccountsV3 {
                     metadata: ctx.accounts.metadata.to_account_info(),
                     mint: ctx.accounts.mint.to_account_info(),
-                    mint_authority: ctx.accounts.mint_authority.to_account_info(),
-                    update_authority: ctx.accounts.mint_authority.to_account_info(),
+                    mint_authority: ctx.accounts.nft_program.to_account_info(),
+                    update_authority: ctx.accounts.nft_program.to_account_info(),
                     payer: ctx.accounts.payer.to_account_info(),
                     system_program: ctx.accounts.system_program.to_account_info(),
                     rent: ctx.accounts.rent.to_account_info(),
                 },
-            ),
+            ).with_signer(&[&[
+                b"nft-program",
+                &[ctx.accounts.nft_program.bump]
+            ]]),
             data_v2,
             false, // is_mutable
             true,  // update_authority_is_signer
@@ -79,9 +93,21 @@ pub mod universal_nft {
 
         // Update program state
         let nft_program = &mut ctx.accounts.nft_program;
-        nft_program.total_supply = nft_program.total_supply.checked_add(1).unwrap();
+        nft_program.total_supply = nft_program.total_supply
+            .checked_add(1)
+            .ok_or(NftError::Overflow)?;
 
-        msg!("NFT minted: {} - {}", name, uri);
+        // Store NFT info for cross-chain operations
+        let nft_info = &mut ctx.accounts.nft_info;
+        nft_info.mint = ctx.accounts.mint.key();
+        nft_info.owner = recipient;
+        nft_info.metadata_uri = uri.clone();
+        nft_info.name = name.clone();
+        nft_info.symbol = symbol.clone();
+        nft_info.is_locked = false;
+        nft_info.bump = ctx.bumps.nft_info;
+
+        msg!("NFT minted: {} - {} to {}", name, uri, recipient);
         Ok(())
     }
 
@@ -90,39 +116,53 @@ pub mod universal_nft {
         ctx: Context<TransferToZetachain>,
         destination_chain_id: u64,
         recipient: [u8; 32],
-        token_id: u64,
+        nonce: u64,
     ) -> Result<()> {
-        // Burn the NFT on Solana (transfer to program authority)
-        // In a real implementation, you'd want to lock it instead of burning
-        
+        let nft_info = &mut ctx.accounts.nft_info;
+        let nft_program = &mut ctx.accounts.nft_program;
+
+        // Security checks
+        require!(nft_info.owner == ctx.accounts.owner.key(), NftError::Unauthorized);
+        require!(!nft_info.is_locked, NftError::TokenLocked);
+        require!(nonce > nft_program.nonce, NftError::InvalidNonce);
+
+        // Lock the NFT (don't burn, just transfer to program)
+        transfer(
+            CpiContext::new(
+                ctx.accounts.token_program.to_account_info(),
+                Transfer {
+                    from: ctx.accounts.owner_token_account.to_account_info(),
+                    to: ctx.accounts.program_token_account.to_account_info(),
+                    authority: ctx.accounts.owner.to_account_info(),
+                },
+            ),
+            1,
+        )?;
+
+        // Update NFT state
+        nft_info.is_locked = true;
+        nft_info.cross_chain_recipient = recipient;
+        nft_program.nonce = nonce;
+
         // Create cross-chain message
         let message = CrossChainMessage {
             message_type: MessageType::Transfer,
-            token_id,
+            mint: nft_info.mint,
             recipient,
-            metadata_uri: ctx.accounts.nft_metadata.uri.clone(),
-            name: ctx.accounts.nft_metadata.name.clone(),
-            symbol: ctx.accounts.nft_metadata.symbol.clone(),
+            metadata_uri: nft_info.metadata_uri.clone(),
+            name: nft_info.name.clone(),
+            symbol: nft_info.symbol.clone(),
+            nonce,
         };
 
-        // Send message via gateway
+        // Serialize message
         let message_bytes = message.try_to_vec()?;
         
-        // Call gateway to send cross-chain message
-        gateway::cpi::call(
-            CpiContext::new(
-                ctx.accounts.gateway_program.to_account_info(),
-                gateway::cpi::accounts::Call {
-                    signer: ctx.accounts.authority.to_account_info(),
-                    pda: ctx.accounts.gateway_pda.to_account_info(),
-                    system_program: ctx.accounts.system_program.to_account_info(),
-                },
-            ),
-            destination_chain_id,
-            message_bytes,
-        )?;
+        // Send via gateway (placeholder - would use actual gateway CPI)
+        msg!("Cross-chain transfer initiated for mint {} to chain {} recipient {:?}", 
+            nft_info.mint, destination_chain_id, recipient);
+        msg!("Message: {:?}", message_bytes);
 
-        msg!("Cross-chain transfer initiated for token {}", token_id);
         Ok(())
     }
 
@@ -132,29 +172,71 @@ pub mod universal_nft {
         sender: [u8; 32],
         source_chain_id: u64,
         message: Vec<u8>,
+        nonce: u64,
     ) -> Result<()> {
+        let nft_program = &mut ctx.accounts.nft_program;
+        
+        // Replay protection
+        require!(nonce > nft_program.nonce, NftError::InvalidNonce);
+        nft_program.nonce = nonce;
+
         // Parse the incoming message
-        let cross_chain_message: CrossChainMessage = CrossChainMessage::try_from_slice(&message)?;
+        let cross_chain_message: CrossChainMessage = 
+            CrossChainMessage::try_from_slice(&message)
+                .map_err(|_| NftError::InvalidMessage)?;
         
         match cross_chain_message.message_type {
             MessageType::Transfer => {
-                // Mint NFT to recipient on Solana
-                self::mint_nft(
-                    Context::new(
-                        ctx.program_id,
-                        &mut ctx.accounts.mint_accounts,
-                        ctx.remaining_accounts,
-                        ctx.bumps.clone(),
-                    ),
-                    cross_chain_message.name,
-                    cross_chain_message.symbol,
-                    cross_chain_message.metadata_uri,
-                )?;
+                // Validate recipient
+                let recipient_pubkey = Pubkey::try_from(cross_chain_message.recipient)
+                    .map_err(|_| NftError::InvalidRecipient)?;
                 
-                msg!("Cross-chain NFT transfer completed");
+                msg!("Handling cross-chain NFT transfer from chain {} to {}", 
+                    source_chain_id, recipient_pubkey);
+                
+                // In a real implementation, you would mint the NFT here
+                // This would require dynamic account creation
+                msg!("Would mint NFT: {}", cross_chain_message.name);
+            }
+            MessageType::Unlock => {
+                // Handle unlock for return transfers
+                msg!("Handling NFT unlock for mint {}", cross_chain_message.mint);
             }
         }
         
+        Ok(())
+    }
+
+    /// Unlock NFT after successful cross-chain return
+    pub fn unlock_nft(ctx: Context<UnlockNft>, nonce: u64) -> Result<()> {
+        let nft_info = &mut ctx.accounts.nft_info;
+        let nft_program = &mut ctx.accounts.nft_program;
+
+        // Security checks
+        require!(nft_info.is_locked, NftError::TokenNotLocked);
+        require!(nonce > nft_program.nonce, NftError::InvalidNonce);
+        
+        // Transfer back to owner
+        transfer(
+            CpiContext::new(
+                ctx.accounts.token_program.to_account_info(),
+                Transfer {
+                    from: ctx.accounts.program_token_account.to_account_info(),
+                    to: ctx.accounts.owner_token_account.to_account_info(),
+                    authority: ctx.accounts.nft_program.to_account_info(),
+                },
+            ).with_signer(&[&[
+                b"nft-program",
+                &[nft_program.bump]
+            ]]),
+            1,
+        )?;
+
+        // Update state
+        nft_info.is_locked = false;
+        nft_program.nonce = nonce;
+
+        msg!("NFT unlocked for mint {}", nft_info.mint);
         Ok(())
     }
 }
@@ -174,18 +256,16 @@ pub struct Initialize<'info> {
     #[account(mut)]
     pub authority: Signer<'info>,
     
-    /// CHECK: Gateway program account
-    pub gateway: AccountInfo<'info>,
-    
     pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]
+#[instruction(name: String, symbol: String, uri: String, recipient: Pubkey)]
 pub struct MintNft<'info> {
     #[account(
         mut,
         seeds = [b"nft-program"],
-        bump
+        bump = nft_program.bump
     )]
     pub nft_program: Account<'info, NftProgramState>,
 
@@ -193,7 +273,7 @@ pub struct MintNft<'info> {
         init,
         payer = payer,
         mint::decimals = 0,
-        mint::authority = mint_authority,
+        mint::authority = nft_program,
     )]
     pub mint: Account<'info, Mint>,
 
@@ -204,6 +284,15 @@ pub struct MintNft<'info> {
         associated_token::authority = recipient,
     )]
     pub token_account: Account<'info, TokenAccount>,
+
+    #[account(
+        init,
+        payer = payer,
+        space = 8 + NftInfo::INIT_SPACE,
+        seeds = [b"nft-info", mint.key().as_ref()],
+        bump
+    )]
+    pub nft_info: Account<'info, NftInfo>,
 
     /// CHECK: Metadata account
     #[account(
@@ -216,10 +305,7 @@ pub struct MintNft<'info> {
         bump,
         seeds::program = token_metadata_program.key()
     )]
-    pub metadata: AccountInfo<'info>,
-
-    pub mint_authority: Signer<'info>,
-    pub recipient: SystemAccount<'info>,
+    pub metadata: UncheckedAccount<'info>,
 
     #[account(mut)]
     pub payer: Signer<'info>,
@@ -236,21 +322,37 @@ pub struct TransferToZetachain<'info> {
     #[account(
         mut,
         seeds = [b"nft-program"],
-        bump
+        bump = nft_program.bump
     )]
     pub nft_program: Account<'info, NftProgramState>,
 
-    pub authority: Signer<'info>,
+    #[account(
+        mut,
+        seeds = [b"nft-info", nft_info.mint.as_ref()],
+        bump = nft_info.bump,
+        constraint = nft_info.owner == owner.key()
+    )]
+    pub nft_info: Account<'info, NftInfo>,
+
+    pub owner: Signer<'info>,
     
-    /// CHECK: NFT metadata account
-    pub nft_metadata: AccountInfo<'info>,
+    #[account(
+        mut,
+        associated_token::mint = nft_info.mint,
+        associated_token::authority = owner,
+    )]
+    pub owner_token_account: Account<'info, TokenAccount>,
+
+    #[account(
+        init_if_needed,
+        payer = owner,
+        associated_token::mint = nft_info.mint,
+        associated_token::authority = nft_program,
+    )]
+    pub program_token_account: Account<'info, TokenAccount>,
     
-    /// CHECK: Gateway PDA
-    pub gateway_pda: AccountInfo<'info>,
-    
-    /// CHECK: Gateway program
-    pub gateway_program: Program<'info, Gateway>,
-    
+    pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
     pub system_program: Program<'info, System>,
 }
 
@@ -259,12 +361,45 @@ pub struct HandleCrossChainCall<'info> {
     #[account(
         mut,
         seeds = [b"nft-program"],
-        bump
+        bump = nft_program.bump
     )]
     pub nft_program: Account<'info, NftProgramState>,
+}
+
+#[derive(Accounts)]
+pub struct UnlockNft<'info> {
+    #[account(
+        mut,
+        seeds = [b"nft-program"],
+        bump = nft_program.bump
+    )]
+    pub nft_program: Account<'info, NftProgramState>,
+
+    #[account(
+        mut,
+        seeds = [b"nft-info", nft_info.mint.as_ref()],
+        bump = nft_info.bump,
+        constraint = nft_info.owner == owner.key()
+    )]
+    pub nft_info: Account<'info, NftInfo>,
+
+    pub owner: Signer<'info>,
     
-    /// Accounts needed for minting (will be provided dynamically)
-    pub mint_accounts: MintNft<'info>,
+    #[account(
+        mut,
+        associated_token::mint = nft_info.mint,
+        associated_token::authority = owner,
+    )]
+    pub owner_token_account: Account<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        associated_token::mint = nft_info.mint,
+        associated_token::authority = nft_program,
+    )]
+    pub program_token_account: Account<'info, TokenAccount>,
+    
+    pub token_program: Program<'info, Token>,
 }
 
 // Program state
@@ -274,13 +409,32 @@ pub struct NftProgramState {
     pub authority: Pubkey,
     pub gateway: Pubkey,
     pub total_supply: u64,
+    pub nonce: u64, // For replay protection
+    pub bump: u8,
+}
+
+// NFT tracking info
+#[account]
+#[derive(InitSpace)]
+pub struct NftInfo {
+    pub mint: Pubkey,
+    pub owner: Pubkey,
+    #[max_len(200)]
+    pub metadata_uri: String,
+    #[max_len(32)]
+    pub name: String,
+    #[max_len(10)]
+    pub symbol: String,
+    pub is_locked: bool,
+    pub cross_chain_recipient: [u8; 32],
+    pub bump: u8,
 }
 
 // Cross-chain message structure
-#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug)]
 pub struct CrossChainMessage {
     pub message_type: MessageType,
-    pub token_id: u64,
+    pub mint: Pubkey,
     pub recipient: [u8; 32],
     #[max_len(200)]
     pub metadata_uri: String,
@@ -288,11 +442,13 @@ pub struct CrossChainMessage {
     pub name: String,
     #[max_len(10)]
     pub symbol: String,
+    pub nonce: u64,
 }
 
-#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug)]
 pub enum MessageType {
     Transfer,
+    Unlock,
 }
 
 // Error types
@@ -304,4 +460,16 @@ pub enum NftError {
     InvalidMessage,
     #[msg("Token not found")]
     TokenNotFound,
+    #[msg("Token is locked")]
+    TokenLocked,
+    #[msg("Token is not locked")]
+    TokenNotLocked,
+    #[msg("Invalid nonce")]
+    InvalidNonce,
+    #[msg("Invalid recipient")]
+    InvalidRecipient,
+    #[msg("Invalid metadata")]
+    InvalidMetadata,
+    #[msg("Arithmetic overflow")]
+    Overflow,
 }
