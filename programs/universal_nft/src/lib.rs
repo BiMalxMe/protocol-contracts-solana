@@ -1,5 +1,6 @@
 use anchor_lang::prelude::*;
 use anchor_lang::solana_program::compute_budget::ComputeBudgetInstruction;
+use anchor_lang::solana_program::sysvar;
 use anchor_spl::{
     associated_token::AssociatedToken,
     metadata::{create_metadata_accounts_v3, CreateMetadataAccountsV3, Metadata},
@@ -12,6 +13,15 @@ use mpl_token_metadata::{
 
 // this is the program id, dont forget to update if u redeploy
 declare_id!("7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsUgit");
+
+/// Gateway program ID
+pub mod gateway {
+    use anchor_lang::prelude::declare_id;
+    #[cfg(feature = "dev")]
+    declare_id!("94U5AHQMKkV5txNJ17QPXWoh474PheGou6cNP2FEuL1d");
+    #[cfg(not(feature = "dev"))]
+    declare_id!("ZETAjseVjuFsxdRxo6MmTCvqFwb3ZHUx56Co3vCmGis");
+}
 
 #[program]
 pub mod universal_nft {
@@ -202,6 +212,234 @@ pub mod universal_nft {
             MessageType::Unlock => {
                 // handle unlock for return transfers
                 msg!("Handling NFT unlock for mint {}", cross_chain_message.mint);
+            }
+        }
+        
+        Ok(())
+    }
+
+    /// handle incoming cross-chain call from gateway
+    /// this function is called by the gateway when an nft transfer is initiated from zetachain
+    /// it handles both transfer (minting new nfts) and unlock (returning locked nfts) operations
+    pub fn on_call(
+        ctx: Context<OnCall>,
+        _amount: u64,
+        _sender: [u8; 20],
+        data: Vec<u8>,
+    ) -> Result<()> {
+        // Verify that the caller is the gateway program
+        let current_ix = anchor_lang::solana_program::sysvar::instructions::get_instruction_relative(
+            0,
+            &ctx.accounts.instruction_sysvar_account.to_account_info(),
+        )
+        .map_err(|_| NftError::Unauthorized)?;
+
+        require!(
+            current_ix.program_id == crate::gateway::ID,
+            NftError::Unauthorized
+        );
+
+        let nft_program = &mut ctx.accounts.nft_program;
+        
+        // Parse the incoming message data
+        let cross_chain_message: CrossChainMessage =
+            CrossChainMessage::try_from_slice(&data)
+                .map_err(|_| NftError::InvalidMessage)?;
+        
+        // Update nonce for replay protection
+        require!(cross_chain_message.nonce > nft_program.nonce, NftError::InvalidNonce);
+        nft_program.nonce = cross_chain_message.nonce;
+        
+        match cross_chain_message.message_type {
+            MessageType::Transfer => {
+                // Handle incoming NFT transfer from ZetaChain
+                // Check the recipient is valid pubkey
+                let recipient_pubkey = Pubkey::try_from(cross_chain_message.recipient)
+                    .map_err(|_| NftError::InvalidRecipient)?;
+                
+                msg!("Handling cross-chain NFT transfer from ZetaChain to {}", recipient_pubkey);
+                
+                // Initialize the mint if it hasn't been initialized yet
+                if ctx.accounts.mint.supply == 0 {
+                    anchor_spl::token::initialize_mint(
+                        CpiContext::new_with_signer(
+                            ctx.accounts.token_program.to_account_info(),
+                            anchor_spl::token::InitializeMint {
+                                mint: ctx.accounts.mint.to_account_info(),
+                                rent: ctx.accounts.rent.to_account_info(),
+                            },
+                            &[&[
+                                b"nft-mint",
+                                cross_chain_message.mint.as_ref(),
+                                &[ctx.bumps.mint]
+                            ]]
+                        ),
+                        0, // NFTs have 0 decimals
+                        &ctx.accounts.nft_program.key(),
+                        Some(&ctx.accounts.nft_program.key()),
+                    )?;
+                }
+                
+                // Create associated token account for recipient if it doesn't exist
+                if ctx.accounts.recipient_token_account.data_is_empty() {
+                    anchor_spl::associated_token::create(
+                        CpiContext::new(
+                            ctx.accounts.associated_token_program.to_account_info(),
+                            anchor_spl::associated_token::Create {
+                                payer: ctx.accounts.payer.to_account_info(),
+                                associated_token: ctx.accounts.recipient_token_account.to_account_info(),
+                                authority: recipient_pubkey,
+                                mint: ctx.accounts.mint.to_account_info(),
+                                system_program: ctx.accounts.system_program.to_account_info(),
+                                token_program: ctx.accounts.token_program.to_account_info(),
+                                rent: ctx.accounts.rent.to_account_info(),
+                            }
+                        )
+                    )?;
+                }
+                
+                // Mint the token to the recipient's token account
+                anchor_spl::token::mint_to(
+                    CpiContext::new_with_signer(
+                        ctx.accounts.token_program.to_account_info(),
+                        anchor_spl::token::MintTo {
+                            mint: ctx.accounts.mint.to_account_info(),
+                            to: ctx.accounts.recipient_token_account.to_account_info(),
+                            authority: ctx.accounts.nft_program.to_account_info(),
+                        },
+                        &[&[
+                            b"nft-program",
+                            &[nft_program.bump]
+                        ]]
+                    ),
+                    1 // NFTs have supply of 1
+                )?;
+                
+                // Create metadata for the NFT if it doesn't exist
+                if ctx.accounts.metadata.data_is_empty() {
+                    let data_v2 = DataV2 {
+                        name: cross_chain_message.name.clone(),
+                        symbol: cross_chain_message.symbol.clone(),
+                        uri: cross_chain_message.metadata_uri.clone(),
+                        seller_fee_basis_points: 0,
+                        creators: None,
+                        collection: None,
+                        uses: None,
+                    };
+                    
+                    anchor_spl::metadata::create_metadata_accounts_v3(
+                        CpiContext::new_with_signer(
+                            ctx.accounts.token_metadata_program.to_account_info(),
+                            anchor_spl::metadata::CreateMetadataAccountsV3 {
+                                metadata: ctx.accounts.metadata.to_account_info(),
+                                mint: ctx.accounts.mint.to_account_info(),
+                                mint_authority: ctx.accounts.nft_program.to_account_info(),
+                                update_authority: ctx.accounts.nft_program.to_account_info(),
+                                payer: ctx.accounts.payer.to_account_info(),
+                                system_program: ctx.accounts.system_program.to_account_info(),
+                                rent: ctx.accounts.rent.to_account_info(),
+                            },
+                            &[&[
+                                b"nft-program",
+                                &[nft_program.bump]
+                            ]]
+                        ),
+                        data_v2,
+                        false, // not mutable
+                        true,  // update authority is signer
+                        None,  // no collection details
+                    )?;
+                }
+                
+                // Initialize or update NFT info account to track the NFT
+                let nft_info = &mut ctx.accounts.nft_info;
+                nft_info.mint = ctx.accounts.mint.key();
+                nft_info.owner = recipient_pubkey;
+                nft_info.metadata_uri = cross_chain_message.metadata_uri.clone();
+                nft_info.name = cross_chain_message.name.clone();
+                nft_info.symbol = cross_chain_message.symbol.clone();
+                nft_info.is_locked = false;
+                nft_info.cross_chain_recipient = [0; 32]; // Not applicable for incoming transfers
+                nft_info.bump = ctx.bumps.nft_info;
+                
+                // Update program state
+                nft_program.total_supply = nft_program.total_supply
+                    .checked_add(1)
+                    .ok_or(NftError::Overflow)?;
+                
+                msg!("NFT minted from cross-chain transfer: {} - {} to {}",
+                    cross_chain_message.name, cross_chain_message.metadata_uri, recipient_pubkey);
+            }
+            MessageType::Unlock => {
+                // Handle unlock for return transfers
+                // This would be when an NFT is being sent back from ZetaChain to Solana
+                msg!("Handling NFT unlock for mint {}", cross_chain_message.mint);
+                
+                // For Unlock, we need to transfer an existing NFT back to the owner
+                // The NFT info account should already exist
+                let nft_info = &mut ctx.accounts.nft_info;
+                
+                // Verify the NFT exists and is locked
+                require!(nft_info.is_locked, NftError::TokenNotLocked);
+                
+                // Create program token account if it doesn't exist
+                if ctx.accounts.program_token_account.data_is_empty() {
+                    anchor_spl::associated_token::create(
+                        CpiContext::new(
+                            ctx.accounts.associated_token_program.to_account_info(),
+                            anchor_spl::associated_token::Create {
+                                payer: ctx.accounts.payer.to_account_info(),
+                                associated_token: ctx.accounts.program_token_account.to_account_info(),
+                                authority: ctx.accounts.nft_program.key(),
+                                mint: ctx.accounts.mint.to_account_info(),
+                                system_program: ctx.accounts.system_program.to_account_info(),
+                                token_program: ctx.accounts.token_program.to_account_info(),
+                                rent: ctx.accounts.rent.to_account_info(),
+                            }
+                        )
+                    )?;
+                }
+                
+                // Create owner token account if it doesn't exist
+                if ctx.accounts.owner_token_account.data_is_empty() {
+                    anchor_spl::associated_token::create(
+                        CpiContext::new(
+                            ctx.accounts.associated_token_program.to_account_info(),
+                            anchor_spl::associated_token::Create {
+                                payer: ctx.accounts.payer.to_account_info(),
+                                associated_token: ctx.accounts.owner_token_account.to_account_info(),
+                                authority: nft_info.owner,
+                                mint: ctx.accounts.mint.to_account_info(),
+                                system_program: ctx.accounts.system_program.to_account_info(),
+                                token_program: ctx.accounts.token_program.to_account_info(),
+                                rent: ctx.accounts.rent.to_account_info(),
+                            }
+                        )
+                    )?;
+                }
+                
+                // Transfer the NFT back to the owner
+                anchor_spl::token::transfer(
+                    CpiContext::new_with_signer(
+                        ctx.accounts.token_program.to_account_info(),
+                        anchor_spl::token::Transfer {
+                            from: ctx.accounts.program_token_account.to_account_info(),
+                            to: ctx.accounts.owner_token_account.to_account_info(),
+                            authority: ctx.accounts.nft_program.to_account_info(),
+                        },
+                        &[&[
+                            b"nft-program",
+                            &[nft_program.bump]
+                        ]]
+                    ),
+                    1,
+                )?;
+                
+                // Update NFT state to unlocked
+                nft_info.is_locked = false;
+                nft_info.cross_chain_recipient = [0; 32]; // Clear the cross-chain recipient
+                
+                msg!("NFT unlocked and transferred back to owner for mint {}", nft_info.mint);
             }
         }
         
@@ -401,6 +639,82 @@ pub struct UnlockNft<'info> {
     pub program_token_account: Account<'info, TokenAccount>,
     
     pub token_program: Program<'info, Token>,
+}
+
+/// account struct for the on_call function
+/// handles incoming cross-chain calls from the gateway program
+#[derive(Accounts)]
+#[instruction(mint_key: Pubkey)]
+pub struct OnCall<'info> {
+    /// nft program state account
+    #[account(
+        mut,
+        seeds = [b"nft-program"],
+        bump = nft_program.bump
+    )]
+    pub nft_program: Account<'info, NftProgramState>,
+
+    /// mint account for the nft, created as a pda if needed
+    #[account(
+        init_if_needed,
+        payer = payer,
+        seeds = [b"nft-mint", mint_key.as_ref()],
+        bump,
+        space = 82, // token mint account size
+    )]
+    pub mint: Account<'info, Mint>,
+
+    /// nft info account to track nft metadata and ownership
+    #[account(
+        init_if_needed,
+        payer = payer,
+        space = 8 + NftInfo::INIT_SPACE,
+        seeds = [b"nft-info", mint.key().as_ref()],
+        bump
+    )]
+    pub nft_info: Account<'info, NftInfo>,
+
+    /// metadata account for the nft (metaplex)
+    /// check: this is the metadata account, dont use directly
+    #[account(
+        mut,
+        seeds = [
+            b"metadata",
+            token_metadata_program.key().as_ref(),
+            mint.key().as_ref(),
+        ],
+        bump,
+        seeds::program = token_metadata_program.key()
+    )]
+    pub metadata: UncheckedAccount<'info>,
+
+    /// recipient's token account, created if needed
+    /// check: recipient token account, constraints checked in the handler
+    pub recipient_token_account: AccountInfo<'info>,
+
+    /// program's token account for holding locked nfts
+    /// check: program token account, constraints checked in the handler
+    pub program_token_account: AccountInfo<'info>,
+
+    /// owner's token account for returning unlocked nfts
+    /// check: owner token account, constraints checked in the handler
+    pub owner_token_account: AccountInfo<'info>,
+
+    /// payer for account creation
+    #[account(mut)]
+    pub payer: Signer<'info>,
+
+    /// system accounts
+    pub rent: Sysvar<'info, Rent>,
+    pub system_program: Program<'info, System>,
+    pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub token_metadata_program: Program<'info, Metadata>,
+
+    /// instruction sysvar account for verifying caller is gateway
+    /// check: this is used to verify the caller is the gateway program
+    #[account(address = sysvar::instructions::id())]
+    pub instruction_sysvar_account: UncheckedAccount<'info>,
 }
 
 // program state, stores main info for the contract
