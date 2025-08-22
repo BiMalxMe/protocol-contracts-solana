@@ -32,14 +32,21 @@ pub fn transfer_to_zetachain(destination_chain_id: u64, recipient: [u8; 32], non
 locks nft on solana, sends cross-chain message via gateway
 
 ### handle_cross_chain_call
-```rust  
+```rust
 pub fn handle_cross_chain_call(sender: [u8; 32], source_chain_id: u64, message: Vec<u8>, nonce: u64)
 ```
 receives incoming messages from zetachain gateway
 
+### on_call
+```rust
+pub fn on_call(amount: u64, sender: [u8; 20], data: Vec<u8>)
+```
+handles incoming cross-chain calls from zetachain gateway
+processes both transfer (minting new nfts) and unlock (returning locked nfts) operations
+
 ### unlock_nft
 ```rust
-pub fn unlock_nft(nonce: u64) 
+pub fn unlock_nft(nonce: u64)
 ```
 returns locked nft to original owner
 
